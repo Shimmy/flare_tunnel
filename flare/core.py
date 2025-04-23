@@ -235,7 +235,15 @@ def create_tunnel_with_credentials(account_id, tunnel_name, debug=False):
     return tunnel_id, token_file
 
 def create_tunnel_config(account_id, tunnel_id, tunnel_name, port, local_addr="localhost", custom_domain=None, debug=False):
-    domain = get_account_domain(account_id, debug)
+    # If custom domain is provided, use it
+    if custom_domain:
+        domain = custom_domain
+        if debug:
+            print(f"Debug: Using custom domain: {domain}")
+    else:
+        # Try to get a domain from the account
+        domain = get_account_domain(account_id, debug)
+    
     hostname = f"{tunnel_name}.{domain}"
     
     if debug:
@@ -277,28 +285,69 @@ def create_tunnel_config(account_id, tunnel_id, tunnel_name, port, local_addr="l
             print(f"Debug: Could not parse response as JSON: {response.content[:200]}")
     
     # Try to set up DNS for the tunnel
-    zone_id = "a2dbaff918c783a734197864e6cb7190"  # Using the zone ID from the bash script
     try:
-        # Create CNAME DNS record
-        dns_data = {
-            "type": "CNAME",
-            "name": tunnel_name,  # Use the full tunnel name with timestamp
-            "content": f"{tunnel_id}.cfargotunnel.com",
-            "ttl": 1,  # Auto
-            "proxied": True
-        }
+        # Find the correct zone ID for the domain
+        headers = get_headers()
+        zone_id = None
         
-        if debug:
-            print(f"Debug: Creating DNS record")
-            print(f"Debug: Using zone ID: {zone_id}")
+        if custom_domain:
+            # If using a custom domain, try to find the zone ID for it
+            zones_response = requests.get(
+                f"{CLOUDFLARE_API_URL}/zones?name={custom_domain}",
+                headers=headers
+            )
+            
+            if debug:
+                print(f"Debug: Looking for zone ID for custom domain: {custom_domain}")
+                print(f"Debug: Zones response status: {zones_response.status_code}")
+            
+            if zones_response.status_code == 200:
+                zones = zones_response.json().get("result", [])
+                if zones:
+                    zone_id = zones[0]["id"]
+                    if debug:
+                        print(f"Debug: Found zone ID for {custom_domain}: {zone_id}")
         
-        dns_response = requests.post(
-            f"{CLOUDFLARE_API_URL}/zones/{zone_id}/dns_records",
-            headers=headers,
-            json=dns_data
-        )
+        # If no zone ID found (or no custom domain), try to get zones from the account
+        if not zone_id:
+            # Get all zones from the account
+            zones_response = requests.get(
+                f"{CLOUDFLARE_API_URL}/accounts/{account_id}/zones",
+                headers=headers
+            )
+            
+            if zones_response.status_code == 200:
+                zones = zones_response.json().get("result", [])
+                if zones:
+                    zone_id = zones[0]["id"]
+                    if debug:
+                        print(f"Debug: Using zone ID from account: {zone_id}")
         
-        if debug:
+        # Only create DNS records if we have a valid zone_id
+        if zone_id:
+            # Create CNAME DNS record
+            dns_data = {
+                "type": "CNAME",
+                "name": tunnel_name,  # Use the full tunnel name with timestamp
+                "content": f"{tunnel_id}.cfargotunnel.com",
+                "ttl": 1,  # Auto
+                "proxied": True
+            }
+            
+            if debug:
+                print(f"Debug: Creating DNS record")
+                print(f"Debug: Using zone ID: {zone_id}")
+            
+            dns_response = requests.post(
+                f"{CLOUDFLARE_API_URL}/zones/{zone_id}/dns_records",
+                headers=headers,
+                json=dns_data
+            )
+        elif debug:
+            print(f"Debug: No zone ID found, skipping DNS record creation")
+        
+        # Only process DNS response if we actually made a request
+        if zone_id and debug:
             print(f"Debug: DNS creation response status: {dns_response.status_code}")
             try:
                 response_json = dns_response.json()
@@ -315,8 +364,9 @@ def create_tunnel_config(account_id, tunnel_id, tunnel_name, port, local_addr="l
         if debug:
             print(f"Debug: Failed to set up DNS: {str(e)}")
             print(f"Debug: This is not critical, continuing")
+        zone_id = None
     
-    return hostname, None  # We don't need a config file anymore
+    return hostname, zone_id  # Return the hostname and zone_id
 
 def get_account_domain(account_id, debug=False):
     """Get a domain from the Cloudflare account or use a default."""
@@ -495,7 +545,7 @@ def delete_tunnel_and_dns(account_id, tunnel_id, tunnel_name, zone_id=None, debu
     # Return the number of deleted DNS records
     return dns_records_deleted
 
-def run_cloudflared(token_file, config_file, tunnel_id, account_id, tunnel_name, debug=False):
+def run_cloudflared(token_file, config_file, tunnel_id, account_id, tunnel_name, debug=False, zone_id=None):
     if debug:
         print(f"Debug: Running cloudflared with token file: {token_file}")
     
@@ -519,7 +569,12 @@ def run_cloudflared(token_file, config_file, tunnel_id, account_id, tunnel_name,
                              stdout=subprocess.PIPE if debug else None,
                              stderr=subprocess.PIPE if debug else None)
     
-    zone_id = "a2dbaff918c783a734197864e6cb7190"  # Using the zone ID from the bash script
+    # If debug mode is on, log whether we have a zone_id or not
+    if debug:
+        if zone_id:
+            print(f"Debug: Using zone ID: {zone_id}")
+        else:
+            print(f"Debug: No zone ID provided, will attempt to find zones during cleanup")
     
     # Clean up function to remove token file, terminate process, and cleanup cloudflare resources
     def cleanup():
@@ -644,8 +699,9 @@ def main():
         
         if debug:
             print(f"Debug: Created tunnel with ID: {tunnel_id}")
-            
-        hostname, _ = create_tunnel_config(account_id, tunnel_id, tunnel_name, port, local_addr, custom_domain, debug)
+        
+        # We need to capture the zone_id from the config creation
+        hostname, zone_id = create_tunnel_config(account_id, tunnel_id, tunnel_name, port, local_addr, custom_domain, debug)
         
         print(f"✅ Tunnel created successfully!")
         print(f"🌐 Public URL: https://{hostname}")
@@ -653,7 +709,7 @@ def main():
         print("🔄 Starting cloudflared tunnel client...")
         print("🛑 Press Ctrl+C to stop")
         
-        process = run_cloudflared(token_file, None, tunnel_id, account_id, tunnel_name, debug)
+        process = run_cloudflared(token_file, None, tunnel_id, account_id, tunnel_name, debug, zone_id)
         
         # Wait for the process to finish
         try:
