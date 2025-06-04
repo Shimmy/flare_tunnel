@@ -576,8 +576,15 @@ def run_cloudflared(token_file, config_file, tunnel_id, account_id, tunnel_name,
         else:
             print(f"Debug: No zone ID provided, will attempt to find zones during cleanup")
     
-    # Clean up function to remove token file, terminate process, and cleanup cloudflare resources
+    # Clean up function to remove token file, terminate process, and
+    # cleanup Cloudflare resources. The flag ensures it only runs once.
+    cleanup_called = False
+
     def cleanup():
+        nonlocal cleanup_called
+        if cleanup_called:
+            return
+        cleanup_called = True
         if os.path.exists(token_file):
             os.remove(token_file)
             if debug:
@@ -586,19 +593,20 @@ def run_cloudflared(token_file, config_file, tunnel_id, account_id, tunnel_name,
             process.terminate()
             if debug:
                 print(f"Debug: Terminated cloudflared process")
-        
+
         print("🧹 Cleaning up Cloudflare resources...")
         dns_records_deleted = delete_tunnel_and_dns(account_id, tunnel_id, tunnel_name, zone_id, debug)
         print(f"✅ Cleanup complete! Removed tunnel and {dns_records_deleted} DNS record(s)")
     
-    # Register cleanup on exit
+    # Register cleanup on normal program exit. The handler will also run
+    # when we exit via the signal handler below.
     atexit.register(cleanup)
     
-    # Handle keyboard interrupt
+    # Handle keyboard interrupt. We just exit here and allow the
+    # atexit handler above to perform cleanup so it only runs once.
     def signal_handler(sig, frame):
         if debug:
-            print(f"Debug: Received signal {sig}, cleaning up")
-        cleanup()
+            print(f"Debug: Received signal {sig}, exiting")
         sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
